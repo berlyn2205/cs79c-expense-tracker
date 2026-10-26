@@ -1,0 +1,180 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Berlyn's serverless expense tracker for CS79C
+
+Resources:
+  ExpensesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-expenses'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: expenseId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: expenseId
+          KeyType: HASH
+
+  ExpenseLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ExpenseTableAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:Scan
+                Resource: !GetAtt ExpensesTable.Arn
+
+  ExpenseFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ExpenseLambdaRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ExpensesTable
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import uuid
+          from datetime import datetime, timezone
+          from decimal import Decimal, InvalidOperation
+          import boto3
+
+          table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
+
+          def respond(status, payload):
+              return {
+                  "statusCode": status,
+                  "headers": {"content-type": "application/json"},
+                  "body": json.dumps(payload, default=str)
+              }
+
+          def handler(event, context):
+              method = event.get("requestContext", {}).get("http", {}).get("method", "GET")
+
+              if method == "POST":
+                  try:
+                      body = json.loads(event.get("body") or "{}")
+                      amount = Decimal(str(body["amount"]))
+                      if not amount.is_finite() or amount <= 0:
+                          return respond(400, {"error": "amount must be a positive number"})
+                  except (ValueError, TypeError, KeyError, InvalidOperation):
+                      return respond(400, {"error": "Provide a valid positive amount"})
+
+                  expense = {
+                      "expenseId": str(uuid.uuid4()),
+                      "amount": str(amount),
+                      "category": str(body.get("category", "Other"))[:80],
+                      "description": str(body.get("description", ""))[:250],
+                      "createdAt": datetime.now(timezone.utc).isoformat(),
+                      "createdBy": "Berlyn"
+                  }
+                  table.put_item(Item=expense)
+                  return respond(201, {
+                      "message": "Expense saved",
+                      "project": "Berlyn's Expense Tracker",
+                      "expense": expense
+                  })
+
+              if method == "GET":
+                  result = table.scan()
+                  items = result.get("Items", [])
+                  items.sort(key=lambda item: item.get("createdAt", ""), reverse=True)
+                  return respond(200, {
+                      "project": "Berlyn's Expense Tracker",
+                      "count": len(items),
+                      "expenses": items
+                  })
+
+              return respond(405, {"error": "Method not allowed"})
+
+  ExpenseHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      ProtocolType: HTTP
+      Description: API for Berlyn's expense tracker
+
+  ExpenseIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ExpenseHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ExpenseFunction.Arn
+      IntegrationMethod: POST
+      PayloadFormatVersion: '2.0'
+
+  GetExpensesRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ExpenseHttpApi
+      RouteKey: 'GET /expenses'
+      Target: !Sub 'integrations/${ExpenseIntegration}'
+
+  PostExpenseRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ExpenseHttpApi
+      RouteKey: 'POST /expenses'
+      Target: !Sub 'integrations/${ExpenseIntegration}'
+
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref ExpenseHttpApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ExpenseFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExpenseHttpApi}/*/*/expenses'
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Alarm if the expense Lambda reports an error.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ExpenseFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ApiEndpoint:
+    Description: Base URL for the expense tracker API
+    Value: !Sub 'https://${ExpenseHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/expenses'
+  DynamoDBTableName:
+    Description: DynamoDB table storing expenses
+    Value: !Ref ExpensesTable
+  LambdaFunctionName:
+    Description: Expense processing Lambda function
+    Value: !Ref ExpenseFunction
+  CloudWatchAlarmName:
+    Description: Lambda error alarm
+    Value: !Ref LambdaErrorAlarm

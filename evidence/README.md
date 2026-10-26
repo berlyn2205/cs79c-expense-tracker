@@ -1,0 +1,1 @@
+Place actual screenshots in this folder after deployment. Suggested evidence: CloudFormation CREATE_COMPLETE; successful POST; successful GET; DynamoDB item; Lambda logs/CloudWatch alarm. Do not put secrets in screenshots.

@@ -1,0 +1,6 @@
+flowchart TD
+    Client[Client / curl] --> API[Amazon API Gateway HTTP API]
+    API --> Lambda[AWS Lambda - Python]
+    Lambda --> DB[(Amazon DynamoDB)]
+    Lambda --> Logs[Amazon CloudWatch Logs]
+    Alarm[Amazon CloudWatch Alarm] -. monitors errors .-> Lambda
